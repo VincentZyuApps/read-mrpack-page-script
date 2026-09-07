@@ -438,7 +438,7 @@ class MrpackServer(ThreadingHTTPServer):
         super().server_close()
 
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 
 PAGE = r'''<!doctype html>
@@ -932,6 +932,8 @@ PAGE = r'''<!doctype html>
             treeLimited: "⚠️ Text scan limited · {count} matches",
             treeNoMatches: "No matching files or folders",
             treeClear: "Clear tree search",
+            treePrevious: "Previous match",
+            treeNext: "Next match",
             all: "All sides",
             both: "🔁 Both",
             clientOnly: "🖥️ Client only",
@@ -973,6 +975,8 @@ PAGE = r'''<!doctype html>
             treeLimited: "⚠️ 文本扫描受限 · {count} 个匹配项",
             treeNoMatches: "没有匹配的文件或文件夹",
             treeClear: "清除文件树搜索",
+            treePrevious: "上一个匹配项",
+            treeNext: "下一个匹配项",
             all: "全部侧别",
             both: "🔁 双端",
             clientOnly: "🖥️ 仅客户端",
@@ -1014,6 +1018,8 @@ PAGE = r'''<!doctype html>
             treeLimited: "⚠️ 文字掃描受限 · {count} 個相符項目",
             treeNoMatches: "沒有相符的檔案或資料夾",
             treeClear: "清除檔案樹搜尋",
+            treePrevious: "上一個相符項目",
+            treeNext: "下一個相符項目",
             all: "全部側別",
             both: "🔁 雙端",
             clientOnly: "🖥️ 僅用戶端",
@@ -1108,7 +1114,7 @@ PAGE = r'''<!doctype html>
         const view = document.createElement("section");
         view.className = "view";
         view.id = "view-tree";
-        view.innerHTML = '<div class="toolbar tree-toolbar"><input id="tree-filter" /><button id="clear-tree-filter" type="button">🧹</button><span id="tree-search-status"></span></div><div class="tree" id="tree" tabindex="0"></div>';
+        view.innerHTML = '<div class="toolbar tree-toolbar"><input id="tree-filter" /><button id="clear-tree-filter" type="button">🧹</button><button id="previous-tree-match" type="button" disabled>↑</button><button id="next-tree-match" type="button" disabled>↓</button><span id="tree-search-status"></span></div><div class="tree" id="tree" tabindex="0"></div>';
         document.querySelector(".tabs").append(tab);
         document.querySelector("#content").append(view);
         tab.addEventListener("click", () => {
@@ -1264,6 +1270,9 @@ PAGE = r'''<!doctype html>
       }
       function updateTreeSearchStatus(search = treeSearch) {
         const status = $("tree-search-status");
+        const hasMatches = Boolean(search?.matches?.length);
+        $("previous-tree-match").disabled = !hasMatches;
+        $("next-tree-match").disabled = !hasMatches;
         if (!search?.query) {
           status.textContent = "";
         } else if (search.limited) {
@@ -1340,6 +1349,8 @@ PAGE = r'''<!doctype html>
         $("filter").placeholder = t("filter");
         $("tree-filter").placeholder = t("treeFilter");
         $("clear-tree-filter").title = $("clear-tree-filter").ariaLabel = t("treeClear");
+        $("previous-tree-match").title = $("previous-tree-match").ariaLabel = t("treePrevious");
+        $("next-tree-match").title = $("next-tree-match").ariaLabel = t("treeNext");
         if (data) render(data, false);
       }
       function render(pack, resetTreeSearch = true) {
@@ -1463,6 +1474,8 @@ PAGE = r'''<!doctype html>
         $("tree-filter").value = "";
         scheduleTreeSearch();
       });
+      $("previous-tree-match").addEventListener("click", () => moveTreeMatch(-1));
+      $("next-tree-match").addEventListener("click", () => moveTreeMatch(1));
       $("tree").addEventListener("keydown", (event) => {
         if (["ArrowUp", "w", "W"].includes(event.key)) {
           moveTreeMatch(-1);

@@ -10,7 +10,7 @@
 - 🔗 展示 Minecraft、Fabric Loader 等整合包依赖项。 / 🔗 Display modpack dependencies such as Minecraft and Fabric Loader.
 - 🗂️ 展示 Modrinth 索引文件，并可按路径或客户端 / 服务端侧别筛选。 / 🗂️ Display Modrinth indexed files, with filtering by path or client / server side.
 - 📦 展示 ZIP 归档根目录统计与完整可折叠文件树。 / 📦 Display ZIP archive root statistics and a complete collapsible file tree.
-- 🔎 在文件树中搜索文件名、文件夹名或受限 UTF-8 文本内容，并用方向键或 W/S 切换匹配项。 / 🔎 Search the file tree by file name, folder name, or bounded UTF-8 text content, then navigate matches with arrow keys or W/S.
+- 🔎 在文件树中搜索文件名、文件夹名或受限 UTF-8 文本内容，并用上/下按钮、方向键或 W/S 切换匹配项。 / 🔎 Search the file tree by file name, folder name, or bounded UTF-8 text content, then navigate matches with previous/next buttons, arrow keys, or W/S.
 - 🌐 提供简体中文、繁体中文、英文和跟随系统语言模式。 / 🌐 Provide Simplified Chinese, Traditional Chinese, English, and a follow-system language mode.
 - 🖥️ 提供跟随系统、深色、浅色三种主题模式。 / 🖥️ Provide follow-system, dark, and light theme modes.
 
