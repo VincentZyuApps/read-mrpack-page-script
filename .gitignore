@@ -1,0 +1,18 @@
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Test, coverage, and local runtime output
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Local configuration and operating-system files
+.env
+.env.*
+.DS_Store
+Thumbs.db

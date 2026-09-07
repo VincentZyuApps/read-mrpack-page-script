@@ -1,0 +1,8 @@
+# Keep source and documentation diffs portable across platforms.
+* text=auto eol=lf
+*.py text eol=lf
+# Apply to every Markdown file, including README.md.
+*.md text eol=lf
+
+# Preview assets are binary files.
+*.png binary
