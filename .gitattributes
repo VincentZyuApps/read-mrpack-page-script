@@ -1,8 +1,15 @@
 # Keep source and documentation diffs portable across platforms.
 * text=auto eol=lf
-*.py text eol=lf
-# Apply to every Markdown file, including README.md.
-*.md text eol=lf
+
+# Include source, project configuration, automation, and documentation in Linguist statistics.
+.gitattributes linguist-language=Git-Attributes linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
+*.py text eol=lf linguist-language=Python linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
+*.md text eol=lf linguist-language=Markdown linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
+*.toml text eol=lf linguist-language=TOML linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
+*.yml text eol=lf linguist-language=YAML linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
+*.yaml text eol=lf linguist-language=YAML linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
+.github/**/*.yml text eol=lf linguist-language=YAML linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
+.github/**/*.yaml text eol=lf linguist-language=YAML linguist-detectable=true -linguist-documentation -linguist-vendored -linguist-generated
 
 # Preview assets are binary files.
 *.png binary
