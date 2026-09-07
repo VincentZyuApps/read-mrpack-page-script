@@ -438,7 +438,7 @@ class MrpackServer(ThreadingHTTPServer):
         super().server_close()
 
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 
 PAGE = r'''<!doctype html>
