@@ -2,6 +2,10 @@
 
 🧭 使用 Python 标准库构建的单文件 WebUI，用于读取和浏览 Modrinth `.mrpack` 整合包。
 
+[![Modrinth](https://img.shields.io/badge/Modrinth-1BD96A?style=for-the-badge&logo=modrinth&logoColor=white)](https://modrinth.com/plugin/qwq-flytre-bingo-booster)
+
+📚 MRPACK 相关文档：[Modrinth Modpacks 文档](https://support.modrinth.com/en/articles/8802250-modpacks-on-modrinth)
+
 ## ✨ 功能
 
 - 📂 支持启动参数预加载本地 `.mrpack`，也支持浏览器选择或拖放上传。
@@ -70,6 +74,10 @@ python .\read_mrpack_page.py --host 0.0.0.0 --port 60907 --mrpack 'G:\GGames\Min
 # 📦 MRPACK Inspector
 
 🧭 A single-file WebUI built with the Python standard library for reading and browsing Modrinth `.mrpack` modpacks.
+
+[![Modrinth](https://img.shields.io/badge/Modrinth-1BD96A?style=for-the-badge&logo=modrinth&logoColor=white)](https://modrinth.com/plugin/qwq-flytre-bingo-booster)
+
+📚 MRPACK documentation: [Modrinth Modpacks documentation](https://support.modrinth.com/en/articles/8802250-modpacks-on-modrinth)
 
 ## ✨ Features
 
