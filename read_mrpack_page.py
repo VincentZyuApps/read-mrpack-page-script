@@ -12,6 +12,7 @@ import threading
 import urllib.parse
 import zipfile
 from collections import Counter
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +23,8 @@ DEFAULT_PORT = 60907
 DEFAULT_MAX_UPLOAD_MIB = 1024
 MAX_INDEX_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 100_000
+MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
+MAX_TEXT_TOTAL_BYTES = 32 * 1024 * 1024
 
 
 class PackError(ValueError):
@@ -54,7 +57,110 @@ def side_group(entry: dict[str, Any]) -> str:
     return "unsupported"
 
 
-def parse_mrpack(path: Path, source: str) -> dict[str, Any]:
+PathKey = tuple[str, ...]
+
+
+@dataclass(slots=True)
+class TextSearchCache:
+    contents: dict[PathKey, str] = field(default_factory=dict)
+    scanned_bytes: int = 0
+    limited: bool = False
+
+
+def archive_key(filename: str) -> PathKey:
+    return tuple(part for part in filename.rstrip("/").split("/") if part)
+
+
+def archive_paths(entries: list[zipfile.ZipInfo]) -> tuple[set[PathKey], set[PathKey], dict[PathKey, zipfile.ZipInfo]]:
+    all_paths: set[PathKey] = set()
+    directories: set[PathKey] = set()
+    files: dict[PathKey, zipfile.ZipInfo] = {}
+    for info in entries:
+        path = archive_key(info.filename)
+        if not path:
+            continue
+        all_paths.add(path)
+        for index in range(1, len(path)):
+            directories.add(path[:index])
+            all_paths.add(path[:index])
+        if info.is_dir():
+            directories.add(path)
+        else:
+            files[path] = info
+    return all_paths, directories, files
+
+
+def scan_text_contents(path: Path, entries: list[zipfile.ZipInfo]) -> TextSearchCache:
+    """Decode only bounded UTF-8 entries and retain no non-text data."""
+
+    _, _, files = archive_paths(entries)
+    cache = TextSearchCache()
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for key, info in sorted(files.items()):
+                if info.file_size > MAX_TEXT_FILE_BYTES:
+                    continue
+                if cache.scanned_bytes + info.file_size > MAX_TEXT_TOTAL_BYTES:
+                    cache.limited = True
+                    continue
+                try:
+                    payload = archive.read(info)
+                except (OSError, RuntimeError, zipfile.BadZipFile):
+                    continue
+                cache.scanned_bytes += len(payload)
+                if len(payload) > MAX_TEXT_FILE_BYTES or b"\x00" in payload:
+                    continue
+                try:
+                    cache.contents[key] = payload.decode("utf-8-sig").casefold()
+                except UnicodeDecodeError:
+                    continue
+    except (OSError, zipfile.BadZipFile):
+        return cache
+    return cache
+
+
+def search_archive_tree(
+    path: Path,
+    entries: list[zipfile.ZipInfo],
+    query: str,
+    cache: TextSearchCache | None,
+) -> tuple[dict[str, Any], TextSearchCache | None]:
+    """Return filtered tree paths, keeping archive text private on the server."""
+
+    needle = query.casefold().strip()
+    all_paths, directories, _ = archive_paths(entries)
+    if not needle:
+        return {"matches": [], "visible_paths": ["/".join(key) for key in sorted(all_paths)], "limited": False}, cache
+    if cache is None:
+        cache = scan_text_contents(path, entries)
+
+    sources: dict[PathKey, set[str]] = {}
+    for path_key in all_paths:
+        for index, component in enumerate(path_key):
+            if needle in component.casefold():
+                sources.setdefault(path_key[: index + 1], set()).add("path")
+    for path_key, content in cache.contents.items():
+        if needle in content:
+            sources.setdefault(path_key, set()).add("content")
+
+    visible: set[PathKey] = set()
+    for path_key in sources:
+        for index in range(1, len(path_key) + 1):
+            visible.add(path_key[:index])
+        if path_key in directories:
+            visible.update(candidate for candidate in all_paths if candidate[: len(path_key)] == path_key)
+
+    return {
+        "matches": [
+            {"path": "/".join(path_key), "sources": sorted(match_sources)}
+            for path_key, match_sources in sorted(sources.items())
+        ],
+        "visible_paths": ["/".join(path_key) for path_key in sorted(visible)],
+        "limited": cache.limited,
+    }, cache
+
+
+def parse_mrpack(path: Path, source: str) -> tuple[dict[str, Any], list[zipfile.ZipInfo]]:
     if path.suffix.casefold() != ".mrpack":
         raise PackError("Only .mrpack files are allowed.")
     try:
@@ -133,7 +239,7 @@ def parse_mrpack(path: Path, source: str) -> dict[str, Any]:
             {"name": root, "entries": count, "size": root_sizes[root], "size_label": human_size(root_sizes[root])}
             for root, count in roots.most_common()
         ],
-    }
+    }, entries
 
 
 class ServerState:
@@ -143,15 +249,67 @@ class ServerState:
         self.current: dict[str, Any] | None = None
         self.current_error: str | None = None
         self.lock = threading.Lock()
+        self.current_path: Path | None = None
+        self.current_entries: list[zipfile.ZipInfo] = []
+        self.text_cache: TextSearchCache | None = None
+        self.revision = 0
+        self.upload_path: Path | None = None
         if default_pack:
             try:
-                self.current = parse_mrpack(default_pack, "server")
+                pack, entries = parse_mrpack(default_pack, "server")
+                self.replace_current(pack, default_pack, entries)
             except PackError as error:
                 self.current_error = str(error)
+
+    def replace_current(
+        self, pack: dict[str, Any], path: Path, entries: list[zipfile.ZipInfo], upload_path: Path | None = None
+    ) -> None:
+        previous_upload: Path | None
+        with self.lock:
+            previous_upload = self.upload_path
+            self.revision += 1
+            pack["revision"] = self.revision
+            self.current = pack
+            self.current_path = path
+            self.current_entries = entries
+            self.text_cache = None
+            self.current_error = None
+            self.upload_path = upload_path
+        if previous_upload and previous_upload != upload_path:
+            try:
+                previous_upload.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def current_payload(self) -> dict[str, Any]:
         with self.lock:
             return {"pack": self.current, "error": self.current_error, "max_upload_mib": self.max_upload_mib}
+
+    def search_tree(self, query: str, revision: int) -> dict[str, Any]:
+        with self.lock:
+            if not self.current_path:
+                raise PackError("Load an MRPACK before searching its file tree.")
+            if revision != self.revision:
+                raise PackError("The loaded MRPACK changed. Please search again.")
+            path = self.current_path
+            entries = list(self.current_entries)
+            cache = self.text_cache
+        result, next_cache = search_archive_tree(path, entries, query, cache)
+        with self.lock:
+            if revision != self.revision or path != self.current_path:
+                raise PackError("The loaded MRPACK changed. Please search again.")
+            self.text_cache = next_cache
+        return {"revision": revision, **result}
+
+    def close(self) -> None:
+        with self.lock:
+            upload_path = self.upload_path
+            self.upload_path = None
+        if upload_path:
+            try:
+                upload_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class MrpackHandler(BaseHTTPRequestHandler):
@@ -193,7 +351,11 @@ class MrpackHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        if urllib.parse.urlsplit(self.path).path != "/api/inspect":
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/search-tree":
+            self.search_tree()
+            return
+        if path != "/api/inspect":
             self.send_json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
             return
         length_header = self.headers.get("Content-Length")
@@ -227,8 +389,10 @@ class MrpackHandler(BaseHTTPRequestHandler):
                         raise PackError("Upload ended before all bytes were received.")
                     temporary.write(chunk)
                     remaining -= len(chunk)
-            result = parse_mrpack(temporary_path, "upload")
+            result, entries = parse_mrpack(temporary_path, "upload")
             result["source"]["name"] = filename
+            self.server.state.replace_current(result, temporary_path, entries, temporary_path)
+            temporary_path = None
             self.send_json({"pack": result})
         except PackError as error:
             self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
@@ -241,6 +405,26 @@ class MrpackHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
 
+    def search_tree(self) -> None:
+        length_header = self.headers.get("Content-Length")
+        if not length_header or not length_header.isdigit() or int(length_header) > 4096:
+            self.send_json({"error": "A small JSON search request is required."}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            payload = json.loads(self.rfile.read(int(length_header)).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json({"error": "Search request must be valid JSON."}, HTTPStatus.BAD_REQUEST)
+            return
+        query = payload.get("query") if isinstance(payload, dict) else None
+        revision = payload.get("revision") if isinstance(payload, dict) else None
+        if not isinstance(query, str) or not isinstance(revision, int) or len(query) > 256:
+            self.send_json({"error": "Search query or revision is invalid."}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            self.send_json(self.server.state.search_tree(query, revision))
+        except PackError as error:
+            self.send_json({"error": str(error)}, HTTPStatus.CONFLICT)
+
 
 class MrpackServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -249,8 +433,12 @@ class MrpackServer(ThreadingHTTPServer):
         super().__init__(address, MrpackHandler)
         self.state = state
 
+    def server_close(self) -> None:
+        self.state.close()
+        super().server_close()
 
-VERSION = "0.1.1"
+
+VERSION = "0.1.2"
 
 
 PAGE = r'''<!doctype html>
@@ -527,6 +715,20 @@ PAGE = r'''<!doctype html>
         border-radius: 6px;
         background: var(--panel);
       }
+      .tree:focus {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+      .tree-toolbar {
+        margin-bottom: 10px;
+      }
+      #tree-filter {
+        width: min(470px, 100%);
+      }
+      #tree-search-status {
+        color: var(--muted);
+        align-self: center;
+      }
       .tree details {
         margin-left: 17px;
       }
@@ -544,6 +746,19 @@ PAGE = r'''<!doctype html>
         margin-left: 34px;
         padding: 2px 0;
         overflow-wrap: anywhere;
+      }
+      .tree .match {
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .tree .match-current {
+        background: color-mix(in srgb, var(--accent) 18%, transparent);
+        outline: 1px solid var(--accent);
+      }
+      .tree .empty {
+        display: block;
+        padding: 8px 0;
+        color: var(--muted);
       }
       #theme {
         min-width: 40px;
@@ -696,7 +911,7 @@ PAGE = r'''<!doctype html>
           "en-us": {
             brand: "MRPACK Inspector",
             dropTitle: "Choose or drop an MRPACK",
-            dropCopy: `Only .mrpack files. Upload limit: ${MAX} MiB. Files are deleted after inspection.`,
+            dropCopy: `Only .mrpack files. Upload limit: ${MAX} MiB. Uploaded files stay temporarily for tree content search and are removed when replaced or the server stops.`,
             deps: "🔗 Dependencies",
             files: "🗂️ Indexed Files",
             archive: "📦 Archive",
@@ -711,6 +926,12 @@ PAGE = r'''<!doctype html>
             entries: "🔢 Entries",
             size: "📦 Uncompressed size",
             filter: "🔍 Filter by path or side",
+            treeFilter: "🔎 Search file names, folders, or text contents",
+            treeSearching: "⏳ Searching…",
+            treeMatches: "🔎 {count} matches",
+            treeLimited: "⚠️ Text scan limited · {count} matches",
+            treeNoMatches: "No matching files or folders",
+            treeClear: "Clear tree search",
             all: "All sides",
             both: "🔁 Both",
             clientOnly: "🖥️ Client only",
@@ -731,7 +952,7 @@ PAGE = r'''<!doctype html>
           "zh-cn": {
             brand: "MRPACK 检查器",
             dropTitle: "选择或拖放 MRPACK 文件",
-            dropCopy: `仅允许 .mrpack 文件。上传上限：${MAX} MiB。解析后立即删除上传文件。`,
+            dropCopy: `仅允许 .mrpack 文件。上传上限：${MAX} MiB。上传文件会临时保留以搜索树中的文本内容，并在替换整合包或服务器停止时删除。`,
             deps: "🔗 依赖项",
             files: "🗂️ 索引文件",
             archive: "📦 归档内容",
@@ -746,6 +967,12 @@ PAGE = r'''<!doctype html>
             entries: "🔢 条目数",
             size: "📦 未压缩大小",
             filter: "🔍 按路径或环境侧别筛选",
+            treeFilter: "🔎 搜索文件名、文件夹或文本内容",
+            treeSearching: "⏳ 正在搜索…",
+            treeMatches: "🔎 {count} 个匹配项",
+            treeLimited: "⚠️ 文本扫描受限 · {count} 个匹配项",
+            treeNoMatches: "没有匹配的文件或文件夹",
+            treeClear: "清除文件树搜索",
             all: "全部侧别",
             both: "🔁 双端",
             clientOnly: "🖥️ 仅客户端",
@@ -766,7 +993,7 @@ PAGE = r'''<!doctype html>
           "zh-tw": {
             brand: "MRPACK 檢查器",
             dropTitle: "選擇或拖放 MRPACK 檔案",
-            dropCopy: `僅允許 .mrpack 檔案。上傳上限：${MAX} MiB。解析後立即刪除上傳檔案。`,
+            dropCopy: `僅允許 .mrpack 檔案。上傳上限：${MAX} MiB。上傳檔案會暫時保留以搜尋檔案樹中的文字內容，並在替換整合包或伺服器停止時刪除。`,
             deps: "🔗 相依項目",
             files: "🗂️ 索引檔案",
             archive: "📦 封存內容",
@@ -781,6 +1008,12 @@ PAGE = r'''<!doctype html>
             entries: "🔢 條目數",
             size: "📦 未壓縮大小",
             filter: "🔍 依路徑或環境側別篩選",
+            treeFilter: "🔎 搜尋檔案名稱、資料夾或文字內容",
+            treeSearching: "⏳ 正在搜尋…",
+            treeMatches: "🔎 {count} 個相符項目",
+            treeLimited: "⚠️ 文字掃描受限 · {count} 個相符項目",
+            treeNoMatches: "沒有相符的檔案或資料夾",
+            treeClear: "清除檔案樹搜尋",
             all: "全部側別",
             both: "🔁 雙端",
             clientOnly: "🖥️ 僅用戶端",
@@ -827,7 +1060,11 @@ PAGE = r'''<!doctype html>
       let languageMode = "system",
         lang = systemLanguage(),
         themeMode = "system",
-        data = null;
+        data = null,
+        treeSearch = null,
+        treeMatchIndex = 0,
+        treeSearchTimer = null,
+        treeSearchAbort = null;
       const $ = (id) => document.getElementById(id),
         esc = (value) =>
           String(value ?? "").replace(
@@ -871,7 +1108,7 @@ PAGE = r'''<!doctype html>
         const view = document.createElement("section");
         view.className = "view";
         view.id = "view-tree";
-        view.innerHTML = '<div class="tree" id="tree"></div>';
+        view.innerHTML = '<div class="toolbar tree-toolbar"><input id="tree-filter" /><button id="clear-tree-filter" type="button">🧹</button><span id="tree-search-status"></span></div><div class="tree" id="tree" tabindex="0"></div>';
         document.querySelector(".tabs").append(tab);
         document.querySelector("#content").append(view);
         tab.addEventListener("click", () => {
@@ -944,7 +1181,7 @@ PAGE = r'''<!doctype html>
         ),
       );
       function buildTree(paths) {
-        const root = { folders: {}, files: [] };
+        const root = { folders: {}, files: [], path: "" };
         for (const path of paths || []) {
           const raw = String(path),
             parts = raw.split("/").filter(Boolean),
@@ -954,28 +1191,124 @@ PAGE = r'''<!doctype html>
             if (isDirectory || index < parts.length - 1)
               node =
                 node.folders[part] ||
-                (node.folders[part] = { folders: {}, files: [] });
-            else node.files.push(part);
+                (node.folders[part] = {
+                  folders: {},
+                  files: [],
+                  path: parts.slice(0, index + 1).join("/"),
+                });
+            else
+              node.files.push({
+                name: part,
+                path: parts.slice(0, index + 1).join("/"),
+              });
           });
         }
         return root;
       }
-      function renderTree(pack) {
+      function renderTree(pack, search = treeSearch) {
         $("tab-tree").textContent = t("tree");
+        const matches = new Map(
+          (search?.matches || []).map((match) => [match.path, match]),
+        );
+        const currentPath = search?.matches?.[treeMatchIndex]?.path;
+        const openPaths = new Set();
+        if (currentPath) {
+          const parts = currentPath.split("/");
+          openPaths.add(currentPath);
+          for (let index = 1; index < parts.length; index += 1)
+            openPaths.add(parts.slice(0, index).join("/"));
+        }
+        const pathClass = (path) =>
+          `${matches.has(path) ? " match" : ""}${path === currentPath ? " match-current" : ""}`;
         const renderNode = (node) =>
           Object.keys(node.folders)
             .sort()
-            .map(
-              (name) =>
-                `<details><summary>📁 ${esc(name)}</summary>${renderNode(node.folders[name])}</details>`,
-            )
+            .map((name) => {
+              const child = node.folders[name];
+              const marker = matches.has(child.path) ? "🔎 " : "";
+              return `<details data-tree-path="${esc(child.path)}"${openPaths.has(child.path) ? " open" : ""}><summary class="${pathClass(child.path)}">📁 ${marker}${esc(name)}</summary>${renderNode(child)}</details>`;
+            })
             .join("") +
           node.files
             .sort()
-            .map((name) => `<span class="leaf">📄 ${esc(name)}</span>`)
+            .map((file) => {
+              const marker = matches.has(file.path) ? "🔎 " : "";
+              return `<span class="leaf${pathClass(file.path)}" data-tree-path="${esc(file.path)}">📄 ${marker}${esc(file.name)}</span>`;
+            })
             .join("");
+        const paths = search
+          ? pack.archive_paths.filter((path) => search.visible_paths.includes(String(path).replace(/\/$/, "")))
+          : pack.archive_paths;
+        const body = search?.query && !search.matches.length
+          ? `<span class="empty">🔎 ${esc(t("treeNoMatches"))}</span>`
+          : renderNode(buildTree(paths));
         $("tree").innerHTML =
-          `<details open><summary>📦 ${esc(pack.source.name)}</summary>${renderNode(buildTree(pack.archive_paths))}</details>`;
+          `<details open><summary>📦 ${esc(pack.source.name)}</summary>${body}</details>`;
+      }
+      function focusTreeMatch() {
+        const match = treeSearch?.matches?.[treeMatchIndex];
+        if (!match) return;
+        const target = Array.from($("tree").querySelectorAll("[data-tree-path]")).find(
+          (element) => element.dataset.treePath === match.path,
+        );
+        if (!target) return;
+        target.scrollIntoView({ block: "nearest" });
+        $("tree").focus();
+      }
+      function moveTreeMatch(offset) {
+        if (!treeSearch?.matches?.length) return;
+        treeMatchIndex =
+          (treeMatchIndex + offset + treeSearch.matches.length) % treeSearch.matches.length;
+        renderTree(data);
+        focusTreeMatch();
+      }
+      function updateTreeSearchStatus(search = treeSearch) {
+        const status = $("tree-search-status");
+        if (!search?.query) {
+          status.textContent = "";
+        } else if (search.limited) {
+          status.textContent = t("treeLimited").replace("{count}", search.matches.length);
+        } else {
+          status.textContent = t("treeMatches").replace("{count}", search.matches.length);
+        }
+      }
+      function scheduleTreeSearch() {
+        clearTimeout(treeSearchTimer);
+        treeSearchTimer = setTimeout(searchTree, 350);
+      }
+      async function searchTree() {
+        if (!data) return;
+        const query = $("tree-filter").value;
+        if (!query.trim()) {
+          treeSearchAbort?.abort();
+          treeSearch = null;
+          treeMatchIndex = 0;
+          updateTreeSearchStatus();
+          renderTree(data);
+          return;
+        }
+        treeSearchAbort?.abort();
+        treeSearchAbort = new AbortController();
+        $("tree-search-status").textContent = t("treeSearching");
+        try {
+          const response = await fetch("/api/search-tree", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query, revision: data.revision }),
+            signal: treeSearchAbort.signal,
+          });
+          const result = await response.json();
+          if (!response.ok) throw Error(result.error || response.statusText);
+          if (result.revision !== data.revision || query !== $("tree-filter").value) return;
+          treeSearch = { query, ...result };
+          treeMatchIndex = 0;
+          updateTreeSearchStatus();
+          renderTree(data);
+          focusTreeMatch();
+        } catch (error) {
+          if (error.name !== "AbortError")
+            setNotice(t("loadError").replace("{error}", error.message));
+        }
       }
       setupTreeTab();
       setupControls();
@@ -1005,10 +1338,19 @@ PAGE = r'''<!doctype html>
           ["side-server", "serverOnly"],
         ].forEach(([id, k]) => ($(id).textContent = t(k)));
         $("filter").placeholder = t("filter");
-        if (data) render(data);
+        $("tree-filter").placeholder = t("treeFilter");
+        $("clear-tree-filter").title = $("clear-tree-filter").ariaLabel = t("treeClear");
+        if (data) render(data, false);
       }
-      function render(pack) {
+      function render(pack, resetTreeSearch = true) {
         data = pack;
+        if (resetTreeSearch) {
+          treeSearchAbort?.abort();
+          treeSearch = null;
+          treeMatchIndex = 0;
+          $("tree-filter").value = "";
+          updateTreeSearchStatus();
+        }
         $("content").classList.remove("hidden");
         setNotice("");
         const s = pack.stats,
@@ -1043,6 +1385,7 @@ PAGE = r'''<!doctype html>
           )
           .join("");
         renderFiles();
+        renderTree(data);
       }
       function renderFiles() {
         if (!data) return;
@@ -1063,7 +1406,6 @@ PAGE = r'''<!doctype html>
                 `<tr><td>${esc(x.path)}</td><td>${esc(sideLabel(x.group))}</td><td>${esc(envLabel(x.client))}</td><td>${esc(envLabel(x.server))}</td><td>${esc(x.sha512.slice(0, 16))}</td></tr>`,
             )
             .join("") || '<tr><td colspan="5">—</td></tr>';
-        renderTree(data);
       }
       async function upload(file) {
         if (!file.name.toLowerCase().endsWith(".mrpack")) {
@@ -1116,6 +1458,21 @@ PAGE = r'''<!doctype html>
       });
       $("filter").addEventListener("input", renderFiles);
       $("side").addEventListener("change", renderFiles);
+      $("tree-filter").addEventListener("input", scheduleTreeSearch);
+      $("clear-tree-filter").addEventListener("click", () => {
+        $("tree-filter").value = "";
+        scheduleTreeSearch();
+      });
+      $("tree").addEventListener("keydown", (event) => {
+        if (["ArrowUp", "w", "W"].includes(event.key)) {
+          moveTreeMatch(-1);
+        } else if (["ArrowDown", "s", "S"].includes(event.key)) {
+          moveTreeMatch(1);
+        } else {
+          return;
+        }
+        event.preventDefault();
+      });
       document.querySelectorAll(".tab").forEach((b) =>
         b.addEventListener("click", () => {
           document
