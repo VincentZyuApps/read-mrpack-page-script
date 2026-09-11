@@ -2,7 +2,7 @@
 
 🧭 使用 Python 标准库构建的单文件 WebUI，用于读取和浏览 Modrinth `.mrpack` 整合包。 / 🧭 A single-file WebUI built with the Python standard library for reading and browsing Modrinth `.mrpack` modpacks.
 
-[![Modrinth](https://img.shields.io/badge/Modrinth-1BD96A?style=for-the-badge&logo=modrinth&logoColor=white)](https://support.modrinth.com/en/articles/8802250-modpacks-on-modrinth)
+[![MRPACK 格式文档 / MRPACK Format Specification](https://img.shields.io/badge/Modrinth-1BD96A?style=for-the-badge&logo=modrinth&logoColor=white)](https://support.modrinth.com/en/articles/8802351-modrinth-modpack-format-mrpack)
 
 ## ✨ 功能 / ✨ Features
 
